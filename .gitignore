@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Generated outputs
+processed/
+Processed/
+
+# GoPro and video media
+*.mp4
+*.MP4
+*.lrv
+*.LRV
+*.thm
+*.THM
+
+# Temporary and log files
+*.ffconcat.txt
+*.tmp
+*.log
+
+# Windows
+Thumbs.db
+Desktop.ini
