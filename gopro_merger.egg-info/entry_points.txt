@@ -1,0 +1,2 @@
+[console_scripts]
+gopro-merger = gopro_merger:main

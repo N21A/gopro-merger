@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gopro-merger"
+version = "0.1.0"
+description = "Merge and compress chaptered GoPro videos using FFmpeg."
+readme = "README.md"
+requires-python = ">=3.9"
+authors = [
+    { name = "Nida Anis" }
+]
+keywords = [
+    "gopro",
+    "ffmpeg",
+    "video",
+    "hevc",
+    "video-compression"
+]
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/N21A/gopro-merger"
+Issues = "https://github.com/N21A/gopro-merger/issues"
+
+[project.scripts]
+gopro-merger = "gopro_merger:main"
+
+[tool.setuptools]
+py-modules = ["gopro_merger"]
