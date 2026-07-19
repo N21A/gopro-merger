@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "gopro-merger"
 version = "0.1.0"
-description = "Merge and compress chaptered GoPro videos using FFmpeg."
+description = "A Python tool that automatically groups, combines, and compresses GoPro video chapters using FFmpeg."
 readme = "README.md"
 requires-python = ">=3.9"
 authors = [
