@@ -212,12 +212,18 @@ gopro-merger "/path/to/GoPro/D2S1"
 ```
 
 Outputs are written to a `processed` directory inside the selected source directory.
+When a resolution preset is selected, the output filename includes it, for example `GX0021_merged_hevc_1080p.mp4`.
 
 ## Options
 
 | Option | Description |
 |---|---|
 | `--quality 18-35` | Set HEVC quality. Lower values produce better quality and larger files. Default: `26`. |
+| `--resolution original` | Keep the source resolution. This is the default. |
+| `--resolution 2160p` | Scale to 2160 pixels high while preserving aspect ratio. |
+| `--resolution 1440p` | Scale to 1440 pixels high while preserving aspect ratio. |
+| `--resolution 1080p` | Scale to 1080 pixels high while preserving aspect ratio. |
+| `--resolution 720p` | Scale to 720 pixels high while preserving aspect ratio. |
 | `--speed quality` | Use slower settings for better compression efficiency. |
 | `--speed balanced` | Use a faster balanced NVENC/CPU profile. This is the default. |
 | `--speed fast` | Prioritise encoding speed while retaining reasonable compression. |
@@ -239,6 +245,18 @@ Choose a higher-quality encode:
 
 ```bash
 gopro-merger "/path/to/GoPro/D2S1" --quality 24
+```
+
+Downscale 4K footage to 1080p for a substantially smaller output:
+
+```bash
+gopro-merger "/path/to/GoPro/D2S1" --resolution 1080p --quality 26
+```
+
+For smaller archival files with stronger compression:
+
+```bash
+gopro-merger "/path/to/GoPro/D2S1" --resolution 1080p --quality 29 --speed quality
 ```
 
 Use the faster profile:

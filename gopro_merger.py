@@ -5,6 +5,7 @@ Merge GoPro chapter files and compress them to HEVC/H.265 with FFmpeg.
 Examples:
     gopro-merger "D:\\GoPro\\D2S1"
     gopro-merger "D:\\GoPro\\D2S1" --quality 24
+    gopro-merger "D:\\GoPro\\D2S1" --resolution 1080p
     gopro-merger "D:\\GoPro\\D2S1" --speed fast
     gopro-merger "D:\\GoPro\\D2S1" --encoder cpu
     gopro-merger "D:\\GoPro\\D2S1" --combine-all
@@ -22,6 +23,8 @@ Default behaviour:
 - Falls back automatically to NVENC with software decoding, then CPU libx265.
 - Uses a balanced speed profile by default for faster encoding without giving up
   sensible compression efficiency.
+- Can downscale to 2160p, 1440p, 1080p, or 720p while preserving aspect ratio.
+- Uses GPU-accelerated CUDA scaling when the full NVIDIA path is available.
 - Copies audio and GoPro telemetry/data streams where supported.
 - Deletes .LRV and .THM sidecar files after successful processing.
 - Keeps every original MP4 unless --delete-originals is supplied.
@@ -101,6 +104,16 @@ CPU_SPEED_PROFILES = {
     "balanced": "medium",
     "fast": "fast",
     "maximum": "veryfast",
+}
+
+# Resolution presets use the output height while FFmpeg calculates an even width
+# that preserves the source display aspect ratio. "original" performs no scaling.
+RESOLUTION_HEIGHTS: Dict[str, Optional[int]] = {
+    "original": None,
+    "2160p": 2160,
+    "1440p": 1440,
+    "1080p": 1080,
+    "720p": 720,
 }
 
 
@@ -298,6 +311,32 @@ def encoder_args(encoder: str, quality: int, speed: str) -> List[str]:
     ]
 
 
+def video_filter_args(
+    resolution: str,
+    encoder: str,
+    hardware_decode: bool,
+) -> List[str]:
+    """Return an aspect-ratio-preserving scale filter for the selected path."""
+    target_height = RESOLUTION_HEIGHTS[resolution]
+    if target_height is None:
+        return []
+
+    if encoder == "nvenc" and hardware_decode:
+        # Keep frames in GPU memory and scale them with CUDA before NVENC.
+        video_filter = (
+            f"scale_cuda=-2:{target_height}:"
+            "format=yuv420p:interp_algo=lanczos"
+        )
+    else:
+        # Software scaling is used for CPU encoding and NVENC software decode.
+        video_filter = (
+            f"scale=-2:{target_height}:flags=lanczos,"
+            "format=yuv420p"
+        )
+
+    return ["-vf", video_filter]
+
+
 def run_ffmpeg(
     ffmpeg: str,
     concat_file: Path,
@@ -305,6 +344,7 @@ def run_ffmpeg(
     encoder: str,
     quality: int,
     speed: str,
+    resolution: str,
     overwrite: bool,
     hardware_decode: bool,
 ) -> int:
@@ -331,6 +371,7 @@ def run_ffmpeg(
         "-map", "0:v:0",
         "-map", "0:a?",
         "-map", "0:d?",
+        *video_filter_args(resolution, encoder, hardware_decode),
         *encoder_args(encoder, quality, speed),
         "-c:a", "copy",
         "-c:d", "copy",
@@ -383,10 +424,48 @@ def probe_media(ffprobe: Optional[str], path: Path) -> Optional[Tuple[float, Lis
     return duration, stream_types
 
 
+def probe_video_dimensions(
+    ffprobe: Optional[str],
+    path: Path,
+) -> Optional[Tuple[int, int]]:
+    """Return the first video stream's width and height when available."""
+    if not ffprobe:
+        return None
+
+    result = subprocess.run(
+        [
+            ffprobe,
+            "-v", "error",
+            "-select_streams", "v:0",
+            "-show_entries", "stream=width,height",
+            "-of", "json",
+            str(path),
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        return None
+
+    try:
+        streams = json.loads(result.stdout).get("streams", [])
+        if not streams:
+            return None
+        width = int(streams[0]["width"])
+        height = int(streams[0]["height"])
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+        return None
+
+    return width, height
+
+
 def validate_output(
     ffprobe: Optional[str],
     output: Path,
     sources: Sequence[Path],
+    resolution: str,
 ) -> bool:
     """Validate file size, video presence, and duration before declaring success."""
     try:
@@ -407,6 +486,20 @@ def validate_output(
     if "video" not in output_streams or output_duration <= 0:
         print("Output validation failed: no valid video stream or duration was found.")
         return False
+
+    dimensions = probe_video_dimensions(ffprobe, output)
+    target_height = RESOLUTION_HEIGHTS[resolution]
+    if target_height is not None and dimensions is not None:
+        width, height = dimensions
+        if height != target_height:
+            print(
+                "Output validation failed: expected "
+                f"{resolution} output but received {width}x{height}."
+            )
+            return False
+        print(f"Validated output resolution: {width}x{height} ({resolution}).")
+    elif dimensions is not None:
+        print(f"Validated output resolution: {dimensions[0]}x{dimensions[1]} (original).")
 
     source_durations: List[float] = []
     for source in sources:
@@ -592,6 +685,15 @@ def parse_args() -> argparse.Namespace:
         help="HEVC quality value. Lower = better/larger; higher = smaller. Default: 26.",
     )
     parser.add_argument(
+        "--resolution",
+        choices=tuple(RESOLUTION_HEIGHTS),
+        default="original",
+        help=(
+            "Output resolution. Preserves aspect ratio and calculates an even "
+            "width automatically. Default: original."
+        ),
+    )
+    parser.add_argument(
         "--speed",
         choices=("quality", "balanced", "fast", "maximum"),
         default="balanced",
@@ -693,6 +795,7 @@ def main() -> int:
         hw_decode_enabled = cuda_available and not args.no_hw_decode
         print(f"Hardware decoding: {'CUDA/NVDEC' if hw_decode_enabled else 'software decode'}")
     print(f"Speed profile: {args.speed}")
+    print(f"Resolution: {args.resolution}")
     print(f"Quality: {args.quality}")
     print(f"Output validation: {'ffprobe duration and stream checks' if ffprobe else 'file-size check only'}")
     print(f"Outputs: {output_dir}")
@@ -705,7 +808,13 @@ def main() -> int:
         if not group_files:
             continue
 
-        output = output_dir / f"{safe_output_name(group_name)}_merged_hevc.mp4"
+        resolution_suffix = (
+            "" if args.resolution == "original" else f"_{args.resolution}"
+        )
+        output = output_dir / (
+            f"{safe_output_name(group_name)}_merged_hevc"
+            f"{resolution_suffix}.mp4"
+        )
         if output.exists() and not args.overwrite:
             print(f"\nSkipping {group_name}: output already exists: {output.name}")
             print("Originals for this skipped recording will not be deleted.")
@@ -743,6 +852,7 @@ def main() -> int:
                     encoder=encoder,
                     quality=args.quality,
                     speed=args.speed,
+                    resolution=args.resolution,
                     overwrite=args.overwrite or attempt_number > 1,
                     hardware_decode=hardware_decode,
                 )
@@ -751,7 +861,9 @@ def main() -> int:
                     print(f"\n{label} failed.")
                     continue
 
-                if not validate_output(ffprobe, output, group_files):
+                if not validate_output(
+                    ffprobe, output, group_files, args.resolution
+                ):
                     print(f"\n{label} created an output that did not pass validation.")
                     continue
 
