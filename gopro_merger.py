@@ -7,6 +7,7 @@ Examples:
     python gopro_merger.py "D:\\GoPro\\D2S1" --quality 24
     python gopro_merger.py "D:\\GoPro\\D2S1" --encoder cpu
     python gopro_merger.py "D:\\GoPro\\D2S1" --combine-all
+    python gopro_merger.py "D:\\GoPro\\D2S1" --delete-originals
 
 Without a folder argument, a Windows folder picker is opened.
 
@@ -17,7 +18,9 @@ Default behaviour:
 - Encodes directly to HEVC/H.265 without making a huge intermediate file.
 - Uses NVIDIA NVENC when available; otherwise uses libx265 on the CPU.
 - Deletes .LRV and .THM sidecar files after successful processing.
-- Keeps every original MP4.
+- Keeps every original MP4 unless --delete-originals is supplied.
+- With --delete-originals, asks for explicit confirmation before permanently
+  deleting source MP4 files from recordings completed successfully in this run.
 """
 
 from __future__ import annotations
@@ -260,6 +263,68 @@ def delete_sidecars(files: Iterable[Path]) -> Tuple[int, int]:
     return deleted, failed
 
 
+def unique_paths(files: Iterable[Path]) -> List[Path]:
+    """Return paths in their original order with duplicates removed."""
+    seen = set()
+    result: List[Path] = []
+    for path in files:
+        resolved = path.resolve()
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        result.append(path)
+    return result
+
+
+def format_bytes(size: int) -> str:
+    """Format a byte count using binary units."""
+    value = float(size)
+    units = ("B", "KiB", "MiB", "GiB", "TiB")
+    for unit in units:
+        if value < 1024 or unit == units[-1]:
+            return f"{value:.1f} {unit}" if unit != "B" else f"{int(value)} B"
+        value /= 1024
+    return f"{size} B"
+
+
+def confirm_original_deletion(files: Sequence[Path]) -> bool:
+    """Require an explicit confirmation before permanently deleting MP4 files."""
+    total_size = 0
+    for path in files:
+        try:
+            total_size += path.stat().st_size
+        except OSError:
+            pass
+
+    print("\nWARNING: original MP4 deletion was requested.")
+    print("The following source files will be permanently deleted, not moved to the Recycle Bin:")
+    for path in files:
+        print(f"  - {path.name}")
+    print(f"Files: {len(files)} | Total size: {format_bytes(total_size)}")
+    print("Only files from recordings successfully encoded during this run are listed.")
+
+    try:
+        response = input('Type DELETE to confirm, or press Enter to keep the originals: ')
+    except EOFError:
+        return False
+    return response.strip() == "DELETE"
+
+
+def delete_originals(files: Iterable[Path]) -> Tuple[int, int]:
+    """Permanently delete original MP4 files after confirmation."""
+    deleted = 0
+    failed = 0
+    for path in files:
+        try:
+            path.unlink()
+            print(f"Deleted original: {path.name}")
+            deleted += 1
+        except OSError as exc:
+            print(f"Could not delete {path.name}: {exc}")
+            failed += 1
+    return deleted, failed
+
+
 def safe_output_name(group_name: str) -> str:
     safe = re.sub(r"[^A-Za-z0-9._-]+", "_", group_name).strip("._-")
     return safe or "gopro_video"
@@ -305,6 +370,14 @@ def parse_args() -> argparse.Namespace:
         "--overwrite",
         action="store_true",
         help="Overwrite an existing output file.",
+    )
+    parser.add_argument(
+        "--delete-originals",
+        action="store_true",
+        help=(
+            "After successful processing, ask for confirmation before permanently "
+            "deleting the source MP4 files encoded during this run."
+        ),
     )
     return parser.parse_args()
 
@@ -357,6 +430,7 @@ def main() -> int:
     print(f"Outputs: {output_dir}")
 
     successful_outputs: List[Path] = []
+    deletable_originals: List[Path] = []
     failed_groups: List[str] = []
 
     for group_name, group_files in groups.items():
@@ -366,6 +440,7 @@ def main() -> int:
         output = output_dir / f"{safe_output_name(group_name)}_merged_hevc.mp4"
         if output.exists() and not args.overwrite:
             print(f"\nSkipping {group_name}: output already exists: {output.name}")
+            print("Originals for this skipped recording will not be deleted.")
             successful_outputs.append(output)
             continue
 
@@ -403,6 +478,7 @@ def main() -> int:
 
             if return_code == 0 and output.exists() and output.stat().st_size > 0:
                 successful_outputs.append(output)
+                deletable_originals.extend(group_files)
                 print(f"\nCreated: {output}")
             else:
                 failed_groups.append(group_name)
@@ -423,6 +499,21 @@ def main() -> int:
         elif junk:
             print("\nNo sidecar files were deleted because no output was completed successfully.")
 
+    originals_deleted = original_delete_failures = 0
+    if args.delete_originals:
+        candidates = unique_paths(deletable_originals)
+        if candidates:
+            if confirm_original_deletion(candidates):
+                print("\nDeleting confirmed original MP4 files...")
+                originals_deleted, original_delete_failures = delete_originals(candidates)
+            else:
+                print("\nOriginal MP4 deletion cancelled. All source videos were kept.")
+        else:
+            print(
+                "\nNo original MP4 files are eligible for deletion because no recording "
+                "was successfully encoded during this run."
+            )
+
     print("\n=== Finished ===")
     print(f"Successful output files: {len(successful_outputs)}")
     for output in successful_outputs:
@@ -430,6 +521,9 @@ def main() -> int:
     print(f"Sidecar files deleted: {deleted}")
     if failed_deletes:
         print(f"Sidecar deletion failures: {failed_deletes}")
+    print(f"Original MP4 files deleted: {originals_deleted}")
+    if original_delete_failures:
+        print(f"Original MP4 deletion failures: {original_delete_failures}")
     if failed_groups:
         print("Failed groups:")
         for name in failed_groups:
@@ -438,7 +532,10 @@ def main() -> int:
     else:
         return_code = 0
 
-    print("\nOriginal MP4 files were not deleted.")
+    if not args.delete_originals:
+        print("\nOriginal MP4 files were not deleted. Use --delete-originals to request deletion.")
+    elif originals_deleted == 0:
+        print("\nNo original MP4 files were deleted.")
 
     if used_picker:
         try:
