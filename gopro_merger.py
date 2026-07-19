@@ -332,7 +332,7 @@ def safe_output_name(group_name: str) -> str:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        prog="gopro_merger.py",
+        prog="gopro_merger",
         description="Merge GoPro chapter files, compress to HEVC, and remove .LRV/.THM sidecars."
     )
     parser.add_argument(
