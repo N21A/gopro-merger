@@ -1,6 +1,10 @@
 # gopro-merger
 
-A Python tool that automatically groups, combines, and compresses GoPro video chapters using FFmpeg.
+`gopro-merger` is a command-line tool for automatically grouping, merging, and compressing chaptered GoPro recordings with FFmpeg.
+
+It recognises common GoPro filename formats, combines each recording in chapter order, and encodes the result as HEVC/H.265 to reduce storage use.
+
+> The current release has primarily been tested on Windows. It is designed to run on Windows, macOS, and Linux.
 
 ## Features
 
@@ -10,11 +14,16 @@ A Python tool that automatically groups, combines, and compresses GoPro video ch
 - Merges each recording into one continuous MP4.
 - Compresses video to HEVC/H.265.
 - Uses NVIDIA NVENC when available.
-- Falls back automatically to CPU encoding with `libx265`.
+- Uses CUDA/NVDEC hardware decoding when supported, keeping decoded frames on the GPU for faster end-to-end transcoding.
+- Falls back automatically to NVENC with software decoding, then CPU encoding with `libx265`.
+- Provides `quality`, `balanced`, `fast`, and `maximum` speed profiles.
+- Uses the `balanced` profile by default for faster processing with sensible compression efficiency.
 - Copies audio and GoPro telemetry/data streams where supported.
 - Removes `.LRV` and `.THM` sidecar files after successful processing.
 - Keeps original MP4 files by default.
-- Can optionally delete successfully processed source MP4 files after explicit confirmation.
+- Validates output video streams and duration with `ffprobe` before treating an encode as successful.
+- Shows source size, output size, and the achieved storage reduction.
+- Can permanently delete successfully processed and validated source MP4 files after explicit confirmation.
 - Opens a graphical folder picker when run without a folder argument and Tkinter is available.
 - Requires no third-party Python packages at runtime.
 
@@ -209,13 +218,19 @@ Outputs are written to a `processed` directory inside the selected source direct
 | Option | Description |
 |---|---|
 | `--quality 18-35` | Set HEVC quality. Lower values produce better quality and larger files. Default: `26`. |
+| `--speed quality` | Use slower settings for better compression efficiency. |
+| `--speed balanced` | Use a faster balanced NVENC/CPU profile. This is the default. |
+| `--speed fast` | Prioritise encoding speed while retaining reasonable compression. |
+| `--speed maximum` | Use the fastest settings, with reduced compression efficiency. |
 | `--encoder auto` | Use NVENC when available and fall back to CPU encoding. This is the default. |
 | `--encoder nvenc` | Require NVIDIA NVENC hardware encoding. |
 | `--encoder cpu` | Force CPU encoding with `libx265`. |
+| `--no-hw-decode` | Disable CUDA/NVDEC decoding while still allowing NVENC encoding. |
 | `--combine-all` | Combine every MP4 in the source directory into one output. |
 | `--keep-sidecars` | Keep `.LRV` and `.THM` sidecar files. |
 | `--overwrite` | Overwrite an existing output file. |
 | `--delete-originals` | Offer to permanently delete successfully processed source MP4 files after confirmation. |
+| `--version` | Display the installed version. |
 | `--help` | Display the command-line help. |
 
 ## Examples
@@ -224,6 +239,18 @@ Choose a higher-quality encode:
 
 ```bash
 gopro-merger "/path/to/GoPro/D2S1" --quality 24
+```
+
+Use the faster profile:
+
+```bash
+gopro-merger "/path/to/GoPro/D2S1" --speed fast
+```
+
+Use the maximum-speed profile:
+
+```bash
+gopro-merger "/path/to/GoPro/D2S1" --speed maximum
 ```
 
 Force NVIDIA encoding:
@@ -236,6 +263,12 @@ Force CPU encoding:
 
 ```bash
 gopro-merger "/path/to/GoPro/D2S1" --encoder cpu
+```
+
+Disable hardware decoding while retaining NVENC encoding:
+
+```bash
+gopro-merger "/path/to/GoPro/D2S1" --no-hw-decode
 ```
 
 Keep `.LRV` and `.THM` files:
@@ -272,8 +305,9 @@ Original MP4 files are kept unless `--delete-originals` is supplied.
 
 When `--delete-originals` is used:
 
-- deletion only occurs after FFmpeg successfully creates a non-empty output;
-- only files successfully processed during the current run are eligible;
+- deletion only occurs after FFmpeg successfully creates an output that passes validation;
+- validation checks that the output contains video and that its duration matches the source sequence within a small tolerance;
+- only files successfully processed and validated during the current run are eligible;
 - source files belonging to failed recordings are kept;
 - source files belonging to outputs skipped because they already existed are kept;
 - the program displays the eligible files and their combined size;
@@ -351,6 +385,9 @@ pipx uninstall gopro-merger
 ## Notes
 
 - HEVC/H.265 compression is lossy.
+- The default `balanced` profile uses faster NVENC settings than the original p5 multipass configuration.
+- The `quality` profile is slower but normally provides better compression efficiency.
+- The `maximum` profile is fastest but can produce larger files or lower quality at the same quality value.
 - CPU encoding with `libx265` is normally slower than NVIDIA NVENC.
 - HEVC playback support varies by operating system, application, and installed codecs.
 - GoPro telemetry preservation depends on the streams present in the source files and support in the installed FFmpeg build.

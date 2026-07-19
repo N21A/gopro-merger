@@ -1,6 +1,6 @@
 Metadata-Version: 2.4
 Name: gopro-merger
-Version: 0.1.0
+Version: 0.1.1
 Summary: A Python tool that automatically groups, combines, and compresses GoPro video chapters using FFmpeg.
 Author: Nida Anis
 License-Expression: MIT

@@ -3,35 +3,44 @@
 Merge GoPro chapter files and compress them to HEVC/H.265 with FFmpeg.
 
 Examples:
-    python gopro_merger.py "D:\\GoPro\\D2S1"
-    python gopro_merger.py "D:\\GoPro\\D2S1" --quality 24
-    python gopro_merger.py "D:\\GoPro\\D2S1" --encoder cpu
-    python gopro_merger.py "D:\\GoPro\\D2S1" --combine-all
-    python gopro_merger.py "D:\\GoPro\\D2S1" --delete-originals
+    gopro-merger "D:\\GoPro\\D2S1"
+    gopro-merger "D:\\GoPro\\D2S1" --quality 24
+    gopro-merger "D:\\GoPro\\D2S1" --speed fast
+    gopro-merger "D:\\GoPro\\D2S1" --encoder cpu
+    gopro-merger "D:\\GoPro\\D2S1" --combine-all
+    gopro-merger "D:\\GoPro\\D2S1" --delete-originals
 
-Without a folder argument, a Windows folder picker is opened.
+Without a folder argument, a graphical folder picker is opened when Tkinter is
+available.
 
 Default behaviour:
 - Groups GoPro chapter files belonging to the same recording, for example:
     GX010021.MP4, GX020021.MP4, ... -> one output
 - If no GoPro naming pattern is found, combines all MP4 files in filename order.
-- Encodes directly to HEVC/H.265 without making a huge intermediate file.
-- Uses NVIDIA NVENC when available; otherwise uses libx265 on the CPU.
+- Encodes directly to HEVC/H.265 without making a large intermediate file.
+- Uses NVIDIA NVENC and CUDA/NVDEC hardware decoding when available.
+- Falls back automatically to NVENC with software decoding, then CPU libx265.
+- Uses a balanced speed profile by default for faster encoding without giving up
+  sensible compression efficiency.
+- Copies audio and GoPro telemetry/data streams where supported.
 - Deletes .LRV and .THM sidecar files after successful processing.
 - Keeps every original MP4 unless --delete-originals is supplied.
-- With --delete-originals, asks for explicit confirmation before permanently
-  deleting source MP4 files from recordings completed successfully in this run.
+- With --delete-originals, validates the output and asks for explicit
+  confirmation before permanently deleting eligible source MP4 files.
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 import re
 import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from collections import defaultdict
+from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
@@ -51,12 +60,64 @@ OLD_CHAPTER_RE = re.compile(
 OUTPUT_DIR_NAME = "processed"
 OUTPUT_MARKERS = ("_merged_hevc", "_compressed_hevc")
 SIDECAR_EXTENSIONS = {".lrv", ".thm"}
+MIN_VALID_OUTPUT_BYTES = 1024
+
+# NVENC profiles trade compression efficiency for throughput. The default
+# deliberately avoids the slower p5 + multipass combination while retaining
+# spatial adaptive quantisation and B-frames for sensible compression.
+NVENC_SPEED_PROFILES = {
+    "quality": {
+        "preset": "p5",
+        "multipass": "qres",
+        "spatial_aq": "1",
+        "temporal_aq": "1",
+        "bframes": "3",
+    },
+    "balanced": {
+        "preset": "p3",
+        "multipass": "disabled",
+        "spatial_aq": "1",
+        "temporal_aq": "0",
+        "bframes": "3",
+    },
+    "fast": {
+        "preset": "p2",
+        "multipass": "disabled",
+        "spatial_aq": "1",
+        "temporal_aq": "0",
+        "bframes": "3",
+    },
+    "maximum": {
+        "preset": "p1",
+        "multipass": "disabled",
+        "spatial_aq": "0",
+        "temporal_aq": "0",
+        "bframes": "0",
+    },
+}
+
+CPU_SPEED_PROFILES = {
+    "quality": "slow",
+    "balanced": "medium",
+    "fast": "fast",
+    "maximum": "veryfast",
+}
+
+
+def package_version() -> str:
+    """Return the installed package version, or a development label."""
+    try:
+        return version("gopro-merger")
+    except PackageNotFoundError:
+        return "development"
 
 
 def natural_key(path: Path) -> List[object]:
     """Sort filenames naturally: file2 before file10."""
-    return [int(part) if part.isdigit() else part.lower()
-            for part in re.split(r"(\d+)", path.name)]
+    return [
+        int(part) if part.isdigit() else part.lower()
+        for part in re.split(r"(\d+)", path.name)
+    ]
 
 
 def choose_folder() -> Optional[Path]:
@@ -81,10 +142,20 @@ def executable_or_exit(name: str) -> str:
     executable = shutil.which(name)
     if not executable:
         raise RuntimeError(
-            f"{name} was not found in PATH. Open Command Prompt and confirm that "
+            f"{name} was not found in PATH. Open a terminal and confirm that "
             f"'{name} -version' works."
         )
     return executable
+
+
+def companion_executable(primary: str, companion: str) -> Optional[str]:
+    """Find a companion executable beside FFmpeg or elsewhere on PATH."""
+    primary_path = Path(primary)
+    suffix = primary_path.suffix
+    beside_primary = primary_path.with_name(companion + suffix)
+    if beside_primary.is_file():
+        return str(beside_primary)
+    return shutil.which(companion)
 
 
 def ffmpeg_has_encoder(ffmpeg: str, encoder: str) -> bool:
@@ -96,6 +167,18 @@ def ffmpeg_has_encoder(ffmpeg: str, encoder: str) -> bool:
         check=False,
     )
     return encoder.lower() in result.stdout.lower()
+
+
+def ffmpeg_has_hwaccel(ffmpeg: str, hwaccel: str) -> bool:
+    result = subprocess.run(
+        [ffmpeg, "-hide_banner", "-hwaccels"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        check=False,
+    )
+    available = {line.strip().lower() for line in result.stdout.splitlines()}
+    return hwaccel.lower() in available
 
 
 def parse_gopro_name(path: Path) -> Optional[Tuple[str, int]]:
@@ -130,7 +213,11 @@ def discover_mp4_files(folder: Path) -> List[Path]:
     return sorted(files, key=natural_key)
 
 
-def build_groups(files: Sequence[Path], combine_all: bool, folder_name: str) -> Dict[str, List[Path]]:
+def build_groups(
+    files: Sequence[Path],
+    combine_all: bool,
+    folder_name: str,
+) -> Dict[str, List[Path]]:
     if combine_all:
         return {folder_name: sorted(files, key=natural_key)}
 
@@ -187,23 +274,26 @@ def make_concat_file(folder: Path, files: Sequence[Path]) -> Path:
     return Path(handle.name)
 
 
-def encoder_args(encoder: str, quality: int) -> List[str]:
+def encoder_args(encoder: str, quality: int, speed: str) -> List[str]:
+    """Return encoder arguments for the selected speed/quality trade-off."""
     if encoder == "nvenc":
+        profile = NVENC_SPEED_PROFILES[speed]
         return [
             "-c:v", "hevc_nvenc",
-            "-preset", "p5",
+            "-preset", profile["preset"],
             "-tune", "hq",
             "-rc", "vbr",
             "-cq", str(quality),
             "-b:v", "0",
-            "-multipass", "qres",
-            "-spatial_aq", "1",
-            "-temporal_aq", "1",
+            "-multipass", profile["multipass"],
+            "-spatial_aq", profile["spatial_aq"],
+            "-temporal_aq", profile["temporal_aq"],
+            "-bf", profile["bframes"],
         ]
 
     return [
         "-c:v", "libx265",
-        "-preset", "medium",
+        "-preset", CPU_SPEED_PROFILES[speed],
         "-crf", str(quality),
     ]
 
@@ -214,20 +304,34 @@ def run_ffmpeg(
     output: Path,
     encoder: str,
     quality: int,
+    speed: str,
     overwrite: bool,
+    hardware_decode: bool,
 ) -> int:
     command = [
         ffmpeg,
         "-hide_banner",
         "-y" if overwrite else "-n",
+    ]
+
+    # Keep decoded frames in GPU memory and feed them directly to NVENC. If the
+    # local driver/GPU cannot use this path, the caller retries with software
+    # decoding before falling back to CPU encoding.
+    if encoder == "nvenc" and hardware_decode:
+        command.extend([
+            "-hwaccel", "cuda",
+            "-hwaccel_output_format", "cuda",
+        ])
+
+    command.extend([
         "-f", "concat",
         "-safe", "0",
         "-i", str(concat_file),
-        # Keep the main video, optional audio, and optional GoPro telemetry/data stream.
+        # Keep the main video, optional audio, and optional GoPro telemetry/data.
         "-map", "0:v:0",
         "-map", "0:a?",
         "-map", "0:d?",
-        *encoder_args(encoder, quality),
+        *encoder_args(encoder, quality, speed),
         "-c:a", "copy",
         "-c:d", "copy",
         "-map_metadata", "0",
@@ -235,16 +339,159 @@ def run_ffmpeg(
         "-tag:v", "hvc1",
         "-movflags", "+faststart",
         str(output),
-    ]
+    ])
 
-    print("\nRunning FFmpeg:\n  " + " ".join(f'"{part}"' if " " in part else part for part in command))
+    print(
+        "\nRunning FFmpeg:\n  "
+        + " ".join(f'"{part}"' if " " in part else part for part in command)
+    )
     return subprocess.run(command, check=False).returncode
+
+
+def probe_media(ffprobe: Optional[str], path: Path) -> Optional[Tuple[float, List[str]]]:
+    """Return duration and stream types, or None when probing is unavailable."""
+    if not ffprobe:
+        return None
+
+    result = subprocess.run(
+        [
+            ffprobe,
+            "-v", "error",
+            "-show_entries", "format=duration:stream=codec_type",
+            "-of", "json",
+            str(path),
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        return None
+
+    try:
+        payload = json.loads(result.stdout)
+        duration = float(payload.get("format", {}).get("duration", 0.0))
+        stream_types = [
+            stream.get("codec_type", "")
+            for stream in payload.get("streams", [])
+            if stream.get("codec_type")
+        ]
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None
+
+    return duration, stream_types
+
+
+def validate_output(
+    ffprobe: Optional[str],
+    output: Path,
+    sources: Sequence[Path],
+) -> bool:
+    """Validate file size, video presence, and duration before declaring success."""
+    try:
+        if not output.is_file() or output.stat().st_size < MIN_VALID_OUTPUT_BYTES:
+            print("Output validation failed: output file is missing or empty.")
+            return False
+    except OSError as exc:
+        print(f"Output validation failed: {exc}")
+        return False
+
+    output_probe = probe_media(ffprobe, output)
+    if output_probe is None:
+        if ffprobe:
+            print("WARNING: ffprobe could not validate the output; using file-size validation only.")
+        return True
+
+    output_duration, output_streams = output_probe
+    if "video" not in output_streams or output_duration <= 0:
+        print("Output validation failed: no valid video stream or duration was found.")
+        return False
+
+    source_durations: List[float] = []
+    for source in sources:
+        source_probe = probe_media(ffprobe, source)
+        if source_probe is None or source_probe[0] <= 0:
+            source_durations = []
+            break
+        source_durations.append(source_probe[0])
+
+    if source_durations:
+        expected_duration = sum(source_durations)
+        tolerance = max(3.0, expected_duration * 0.01)
+        difference = abs(output_duration - expected_duration)
+        if difference > tolerance:
+            print(
+                "Output validation failed: duration differs from the source sequence "
+                f"by {difference:.2f} seconds."
+            )
+            return False
+        print(
+            f"Validated duration: {output_duration:.2f}s "
+            f"(expected approximately {expected_duration:.2f}s)."
+        )
+    else:
+        print(f"Validated output video duration: {output_duration:.2f}s.")
+
+    return True
+
+
+def total_file_size(files: Iterable[Path]) -> int:
+    total = 0
+    for path in files:
+        try:
+            total += path.stat().st_size
+        except OSError:
+            pass
+    return total
+
+
+def print_compression_summary(sources: Sequence[Path], output: Path) -> None:
+    source_size = total_file_size(sources)
+    try:
+        output_size = output.stat().st_size
+    except OSError:
+        return
+
+    print(f"Source size: {format_bytes(source_size)}")
+    print(f"Output size: {format_bytes(output_size)}")
+    if source_size > 0:
+        reduction = (1.0 - (output_size / source_size)) * 100.0
+        if reduction >= 0:
+            print(f"Space reduction: {reduction:.1f}%")
+        else:
+            print(f"Output is {-reduction:.1f}% larger than the sources.")
+
+
+def encoding_attempts(
+    selected_encoder: str,
+    requested_encoder: str,
+    cuda_available: bool,
+    disable_hw_decode: bool,
+) -> List[Tuple[str, str, bool]]:
+    """Build a safe ordered list of hardware/software fallback attempts."""
+    if selected_encoder == "cpu":
+        return [("CPU libx265 encoding", "cpu", False)]
+
+    attempts: List[Tuple[str, str, bool]] = []
+    if cuda_available and not disable_hw_decode:
+        attempts.append(("NVIDIA NVENC with CUDA/NVDEC hardware decoding", "nvenc", True))
+
+    attempts.append(("NVIDIA NVENC with software decoding", "nvenc", False))
+
+    if requested_encoder == "auto":
+        attempts.append(("CPU libx265 fallback", "cpu", False))
+
+    return attempts
 
 
 def sidecar_files(folder: Path) -> List[Path]:
     return sorted(
-        [path for path in folder.iterdir()
-         if path.is_file() and path.suffix.lower() in SIDECAR_EXTENSIONS],
+        [
+            path
+            for path in folder.iterdir()
+            if path.is_file() and path.suffix.lower() in SIDECAR_EXTENSIONS
+        ],
         key=natural_key,
     )
 
@@ -289,22 +536,17 @@ def format_bytes(size: int) -> str:
 
 def confirm_original_deletion(files: Sequence[Path]) -> bool:
     """Require an explicit confirmation before permanently deleting MP4 files."""
-    total_size = 0
-    for path in files:
-        try:
-            total_size += path.stat().st_size
-        except OSError:
-            pass
+    total_size = total_file_size(files)
 
     print("\nWARNING: original MP4 deletion was requested.")
-    print("The following source files will be permanently deleted, not moved to the Recycle Bin:")
+    print("The following source files will be permanently deleted, not moved to the Recycle Bin or Trash:")
     for path in files:
         print(f"  - {path.name}")
     print(f"Files: {len(files)} | Total size: {format_bytes(total_size)}")
-    print("Only files from recordings successfully encoded during this run are listed.")
+    print("Only files from recordings successfully encoded and validated during this run are listed.")
 
     try:
-        response = input('Type DELETE to confirm, or press Enter to keep the originals: ')
+        response = input("Type DELETE to confirm, or press Enter to keep the originals: ")
     except EOFError:
         return False
     return response.strip() == "DELETE"
@@ -332,8 +574,8 @@ def safe_output_name(group_name: str) -> str:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        prog="gopro_merger",
-        description="Merge GoPro chapter files, compress to HEVC, and remove .LRV/.THM sidecars."
+        prog="gopro-merger",
+        description="Merge GoPro chapters, compress to HEVC, and remove .LRV/.THM sidecars.",
     )
     parser.add_argument(
         "folder",
@@ -350,10 +592,24 @@ def parse_args() -> argparse.Namespace:
         help="HEVC quality value. Lower = better/larger; higher = smaller. Default: 26.",
     )
     parser.add_argument(
+        "--speed",
+        choices=("quality", "balanced", "fast", "maximum"),
+        default="balanced",
+        help=(
+            "Encoding speed/compression trade-off. balanced is faster than the old "
+            "default while retaining sensible compression. Default: balanced."
+        ),
+    )
+    parser.add_argument(
         "--encoder",
         choices=("auto", "nvenc", "cpu"),
         default="auto",
         help="auto uses NVIDIA NVENC if available, then falls back to CPU. Default: auto.",
+    )
+    parser.add_argument(
+        "--no-hw-decode",
+        action="store_true",
+        help="Disable CUDA/NVDEC hardware decoding while still allowing NVENC encoding.",
     )
     parser.add_argument(
         "--combine-all",
@@ -376,8 +632,13 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help=(
             "After successful processing, ask for confirmation before permanently "
-            "deleting the source MP4 files encoded during this run."
+            "deleting source MP4 files encoded and validated during this run."
         ),
+    )
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"%(prog)s {package_version()}",
     )
     return parser.parse_args()
 
@@ -388,7 +649,7 @@ def main() -> int:
     folder = args.folder or choose_folder()
 
     if folder is None:
-        print("No folder selected.")
+        print("No folder selected, or Tkinter is unavailable.")
         return 1
 
     folder = folder.expanduser().resolve()
@@ -402,6 +663,7 @@ def main() -> int:
         print(f"ERROR: {exc}")
         return 1
 
+    ffprobe = companion_executable(ffmpeg, "ffprobe")
     files = discover_mp4_files(folder)
     if not files:
         print(f"No MP4 files found in: {folder}")
@@ -412,6 +674,7 @@ def main() -> int:
     output_dir.mkdir(exist_ok=True)
 
     nvenc_available = ffmpeg_has_encoder(ffmpeg, "hevc_nvenc")
+    cuda_available = ffmpeg_has_hwaccel(ffmpeg, "cuda")
     if args.encoder == "nvenc" and not nvenc_available:
         print("ERROR: This FFmpeg build does not provide the hevc_nvenc encoder.")
         return 1
@@ -426,7 +689,12 @@ def main() -> int:
     print(f"MP4 files found: {len(files)}")
     print(f"Recording groups: {len(groups)}")
     print(f"Encoder: {'NVIDIA NVENC' if selected_encoder == 'nvenc' else 'CPU libx265'}")
+    if selected_encoder == "nvenc":
+        hw_decode_enabled = cuda_available and not args.no_hw_decode
+        print(f"Hardware decoding: {'CUDA/NVDEC' if hw_decode_enabled else 'software decode'}")
+    print(f"Speed profile: {args.speed}")
     print(f"Quality: {args.quality}")
+    print(f"Output validation: {'ffprobe duration and stream checks' if ffprobe else 'file-size check only'}")
     print(f"Outputs: {output_dir}")
 
     successful_outputs: List[Path] = []
@@ -449,39 +717,59 @@ def main() -> int:
             print(f"  {path.name}")
 
         concat_file = make_concat_file(folder, group_files)
-        try:
-            return_code = run_ffmpeg(
-                ffmpeg=ffmpeg,
-                concat_file=concat_file,
-                output=output,
-                encoder=selected_encoder,
-                quality=args.quality,
-                overwrite=args.overwrite,
-            )
+        attempts = encoding_attempts(
+            selected_encoder=selected_encoder,
+            requested_encoder=requested_encoder,
+            cuda_available=cuda_available,
+            disable_hw_decode=args.no_hw_decode,
+        )
 
-            # An installed FFmpeg can advertise NVENC even when the local NVIDIA
-            # driver/GPU cannot use it. In auto mode, retry once with libx265.
-            if return_code != 0 and requested_encoder == "auto" and selected_encoder == "nvenc":
-                print("\nNVENC failed. Retrying this recording with CPU libx265...")
-                try:
-                    output.unlink(missing_ok=True)
-                except OSError:
-                    pass
+        group_succeeded = False
+        group_start = time.monotonic()
+        try:
+            for attempt_number, (label, encoder, hardware_decode) in enumerate(attempts, start=1):
+                print(f"\nEncoding attempt {attempt_number}/{len(attempts)}: {label}")
+
+                if attempt_number > 1:
+                    try:
+                        output.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+
                 return_code = run_ffmpeg(
                     ffmpeg=ffmpeg,
                     concat_file=concat_file,
                     output=output,
-                    encoder="cpu",
+                    encoder=encoder,
                     quality=args.quality,
-                    overwrite=True,
+                    speed=args.speed,
+                    overwrite=args.overwrite or attempt_number > 1,
+                    hardware_decode=hardware_decode,
                 )
 
-            if return_code == 0 and output.exists() and output.stat().st_size > 0:
+                if return_code != 0:
+                    print(f"\n{label} failed.")
+                    continue
+
+                if not validate_output(ffprobe, output, group_files):
+                    print(f"\n{label} created an output that did not pass validation.")
+                    continue
+
+                group_succeeded = True
                 successful_outputs.append(output)
                 deletable_originals.extend(group_files)
-                print(f"\nCreated: {output}")
-            else:
+                elapsed = time.monotonic() - group_start
+                print(f"\nCreated and validated: {output}")
+                print(f"Encoding time: {elapsed / 60.0:.1f} minutes")
+                print_compression_summary(group_files, output)
+                break
+
+            if not group_succeeded:
                 failed_groups.append(group_name)
+                try:
+                    output.unlink(missing_ok=True)
+                except OSError:
+                    pass
                 print(f"\nFAILED: {group_name}")
         finally:
             try:
@@ -511,7 +799,7 @@ def main() -> int:
         else:
             print(
                 "\nNo original MP4 files are eligible for deletion because no recording "
-                "was successfully encoded during this run."
+                "was successfully encoded and validated during this run."
             )
 
     print("\n=== Finished ===")
